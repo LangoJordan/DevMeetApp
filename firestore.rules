@@ -1,0 +1,405 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isCreator(reunionId) {
+      return signedIn()
+        && get(/databases/$(database)/documents/reunions/$(reunionId)).data.creatorId == request.auth.uid;
+    }
+
+    function isRoomMember(reunionId) {
+      return signedIn()
+        && exists(/databases/$(database)/documents/reunions/$(reunionId)/roomMembers/$(request.auth.uid))
+        && (!('kicked' in get(/databases/$(database)/documents/reunions/$(reunionId)/roomMembers/$(request.auth.uid)).data)
+          || get(/databases/$(database)/documents/reunions/$(reunionId)/roomMembers/$(request.auth.uid)).data.kicked != true);
+    }
+
+    function isRoomManager(reunionId) {
+      return isCreator(reunionId)
+        || (isRoomMember(reunionId)
+          && get(/databases/$(database)/documents/reunions/$(reunionId)/roomMembers/$(request.auth.uid)).data.role in ['host', 'co-host']);
+    }
+
+    function canManageRoomMember(reunionId, targetUid) {
+      let actor = get(/databases/$(database)/documents/reunions/$(reunionId)/roomMembers/$(request.auth.uid)).data;
+      let target = get(/databases/$(database)/documents/reunions/$(reunionId)/roomMembers/$(targetUid)).data;
+      return isCreator(reunionId)
+          ? targetUid != request.auth.uid && target.role != 'host'
+          : isRoomMember(reunionId)
+            && ((actor.role == 'host' && target.role in ['co-host', 'participant'])
+              || (actor.role == 'co-host' && target.role == 'participant'));
+    }
+
+    function isPublicRoom(reunionId) {
+      return get(/databases/$(database)/documents/reunions/$(reunionId)).data.type == 'public';
+    }
+
+    function roomIsOpen(reunionId) {
+      let room = get(/databases/$(database)/documents/reunions/$(reunionId)).data;
+      return room.status != 'completed'
+        && room.status != 'closed'
+        && (!('expiresAt' in room) || request.time < room.expiresAt);
+    }
+
+    match /reunions/{reunionId} {
+      allow get: if signedIn() && (resource.data.type == 'public'
+        || resource.data.creatorId == request.auth.uid
+        || ('invitedUserIds' in resource.data && request.auth.uid in resource.data.invitedUserIds)
+        || isRoomMember(reunionId));
+      allow list: if signedIn() && (resource.data.type == 'public'
+        || resource.data.creatorId == request.auth.uid
+        || ('invitedUserIds' in resource.data && request.auth.uid in resource.data.invitedUserIds)
+        || isRoomMember(reunionId));
+      allow create: if signedIn()
+        && request.resource.data.creatorId == request.auth.uid
+        && request.resource.data.hostId == request.auth.uid
+        && request.resource.data.invitedUserIds is list
+        && request.auth.uid in request.resource.data.invitedUserIds
+        && request.resource.data.maxParticipants <= 6;
+      allow update: if signedIn() && (
+        (isCreator(reunionId) && request.resource.data.creatorId == resource.data.creatorId)
+        || (isRoomManager(reunionId)
+          && request.resource.data.creatorId == resource.data.creatorId
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['invitedUserIds', 'updatedAt']))
+      );
+      allow delete: if false;
+
+      match /roomMembers/{uid} {
+        allow get: if signedIn() && (request.auth.uid == uid || isRoomManager(reunionId));
+        allow list: if isRoomManager(reunionId);
+        allow create: if signedIn()
+          && request.auth.uid == uid
+          && roomIsOpen(reunionId)
+          && request.resource.data.uid == uid
+          && request.resource.data.kicked == false
+          && ((isCreator(reunionId) && request.resource.data.role == 'host')
+            || (isPublicRoom(reunionId) && request.resource.data.role == 'participant')
+            || (request.resource.data.invitationId is string
+              && exists(/databases/$(database)/documents/invitations/$(request.resource.data.invitationId))
+              && get(/databases/$(database)/documents/invitations/$(request.resource.data.invitationId)).data.reunionId == reunionId
+              && get(/databases/$(database)/documents/invitations/$(request.resource.data.invitationId)).data.contactId == request.auth.uid
+              && get(/databases/$(database)/documents/invitations/$(request.resource.data.invitationId)).data.status == 'accepted'
+              && request.resource.data.role == get(/databases/$(database)/documents/invitations/$(request.resource.data.invitationId)).data.role));
+        allow update: if signedIn() && (
+          (request.auth.uid == uid
+            && (!('kicked' in resource.data) || resource.data.kicked != true)
+            && request.resource.data.uid == resource.data.uid
+            && request.resource.data.role == resource.data.role
+            && request.resource.data.kicked == false
+            && (isPublicRoom(reunionId) || isCreator(reunionId)
+              || ('invitationId' in request.resource.data
+                && exists(/databases/$(database)/documents/invitations/$(request.resource.data.invitationId))
+                && get(/databases/$(database)/documents/invitations/$(request.resource.data.invitationId)).data.contactId == uid
+                && get(/databases/$(database)/documents/invitations/$(request.resource.data.invitationId)).data.status == 'accepted')))
+          || (request.auth.uid == uid
+            && resource.data.kicked == true
+            && request.resource.data.kicked == false
+            && request.resource.data.uid == resource.data.uid
+            && request.resource.data.role == resource.data.role
+            && 'reinviteInvitationId' in resource.data
+            && request.resource.data.invitationId == resource.data.reinviteInvitationId
+            && exists(/databases/$(database)/documents/invitations/$(resource.data.reinviteInvitationId))
+            && get(/databases/$(database)/documents/invitations/$(resource.data.reinviteInvitationId)).data.reunionId == reunionId
+            && get(/databases/$(database)/documents/invitations/$(resource.data.reinviteInvitationId)).data.contactId == uid
+            && get(/databases/$(database)/documents/invitations/$(resource.data.reinviteInvitationId)).data.status == 'accepted'
+            && roomIsOpen(reunionId))
+          || (canManageRoomMember(reunionId, uid)
+            && request.resource.data.uid == resource.data.uid
+            && request.resource.data.role == resource.data.role
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['kicked', 'reinviteInvitationId'])
+            && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['kicked']) || request.resource.data.kicked == true)
+            && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['reinviteInvitationId'])
+              || (resource.data.kicked == true
+                && request.resource.data.reinviteInvitationId is string
+                && exists(/databases/$(database)/documents/invitations/$(request.resource.data.reinviteInvitationId))
+                && get(/databases/$(database)/documents/invitations/$(request.resource.data.reinviteInvitationId)).data.reunionId == reunionId
+                && get(/databases/$(database)/documents/invitations/$(request.resource.data.reinviteInvitationId)).data.contactId == uid
+                && get(/databases/$(database)/documents/invitations/$(request.resource.data.reinviteInvitationId)).data.callerId == request.auth.uid
+                && get(/databases/$(database)/documents/invitations/$(request.resource.data.reinviteInvitationId)).data.status == 'pending')))
+        );
+        allow delete: if signedIn()
+          && (!('kicked' in resource.data) || resource.data.kicked != true)
+          && (request.auth.uid == uid || isRoomManager(reunionId));
+      }
+
+      match /participants/{uid} {
+        allow read: if isRoomMember(reunionId);
+        allow create: if signedIn()
+          && request.auth.uid == uid
+          && isRoomMember(reunionId)
+          && roomIsOpen(reunionId)
+          && request.resource.data.uid == uid
+          && request.resource.data.role == get(/databases/$(database)/documents/reunions/$(reunionId)/roomMembers/$(uid)).data.role
+          && request.resource.data.audioLocked == (!(get(/databases/$(database)/documents/reunions/$(reunionId)/roomMembers/$(uid)).data.role in ['host', 'co-host'])
+            && 'participantsCanSpeak' in get(/databases/$(database)/documents/reunions/$(reunionId)).data
+            && get(/databases/$(database)/documents/reunions/$(reunionId)).data.participantsCanSpeak == false)
+          && request.resource.data.videoLocked == (!(get(/databases/$(database)/documents/reunions/$(reunionId)/roomMembers/$(uid)).data.role in ['host', 'co-host'])
+            && 'participantsCanUseCamera' in get(/databases/$(database)/documents/reunions/$(reunionId)).data
+            && get(/databases/$(database)/documents/reunions/$(reunionId)).data.participantsCanUseCamera == false)
+          && request.resource.data.kicked == false
+          && request.resource.data.isScreenSharing is bool
+          && request.resource.data.isScreenSharing == false;
+        allow update: if signedIn() && isRoomMember(reunionId) && (
+          (request.auth.uid == uid
+            && (!('kicked' in resource.data) || resource.data.kicked != true)
+            && request.resource.data.uid == resource.data.uid
+            && request.resource.data.role == resource.data.role
+            && request.resource.data.audioLocked == resource.data.get('audioLocked', false)
+            && request.resource.data.videoLocked == resource.data.get('videoLocked', false)
+            && request.resource.data.isScreenSharing is bool
+            && (!request.resource.data.isScreenSharing
+              || isRoomManager(reunionId)
+              || get(/databases/$(database)/documents/reunions/$(reunionId)).data.participantsCanShareScreen == true)
+            && (!resource.data.get('audioLocked', false) || request.resource.data.isMuted == true)
+            && (!resource.data.get('videoLocked', false) || request.resource.data.isVideoOff == true)
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isMuted', 'isVideoOff', 'isScreenSharing', 'displayName', 'photoURL', 'sessionId', 'joinedAt']))
+          || (canManageRoomMember(reunionId, uid)
+            && request.resource.data.uid == resource.data.uid
+            && request.resource.data.isScreenSharing is bool
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isMuted', 'isVideoOff', 'isScreenSharing', 'audioLocked', 'videoLocked']))
+        );
+        allow delete: if signedIn() && (request.auth.uid == uid || isRoomManager(reunionId));
+      }
+
+      match /connections/{pairId} {
+        allow read: if isRoomMember(reunionId);
+        allow create: if isRoomMember(reunionId)
+          && roomIsOpen(reunionId)
+          && (request.resource.data.offererId == request.auth.uid
+            || request.resource.data.answererId == request.auth.uid);
+        allow update: if isRoomMember(reunionId)
+          && roomIsOpen(reunionId)
+          && (resource.data.offererId == request.auth.uid
+            || resource.data.answererId == request.auth.uid)
+          && request.resource.data.offererId == resource.data.offererId
+          && request.resource.data.answererId == resource.data.answererId;
+        allow delete: if isRoomMember(reunionId)
+          && (resource.data.offererId == request.auth.uid
+            || resource.data.answererId == request.auth.uid);
+
+        match /{candidateCollection}/{candidateId} {
+          allow read: if isRoomMember(reunionId)
+            && candidateCollection in ['offerCandidates', 'answerCandidates'];
+          allow create: if isRoomMember(reunionId)
+            && roomIsOpen(reunionId)
+            && candidateCollection in ['offerCandidates', 'answerCandidates']
+            && request.resource.data.from == request.auth.uid;
+          allow delete: if isRoomMember(reunionId)
+            && candidateCollection in ['offerCandidates', 'answerCandidates'];
+          allow update: if false;
+        }
+      }
+    }
+
+    function isConversationMember(conversationId) {
+      return signedIn()
+        && exists(/databases/$(database)/documents/conversations/$(conversationId))
+        && request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participantIds;
+    }
+
+    function isInvitationParty() {
+      return signedIn()
+        && (resource.data.contactId == request.auth.uid
+          || resource.data.callerId == request.auth.uid
+          || get(/databases/$(database)/documents/reunions/$(resource.data.reunionId)).data.creatorId == request.auth.uid);
+    }
+
+    match /emailDirectory/{email} {
+      allow get: if signedIn();
+      allow list: if false;
+      allow create, update: if signedIn()
+        && request.auth.token.email.lower() == email
+        && request.resource.data.email == email
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.keys().hasOnly(['email', 'uid', 'updatedAt']);
+      allow delete: if signedIn()
+        && request.auth.token.email.lower() == email
+        && resource.data.uid == request.auth.uid;
+    }
+
+    match /profiles/{uid} {
+      allow get: if signedIn() && request.auth.uid == uid;
+      allow list: if false;
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.get('userId', uid) == uid;
+      allow update: if signedIn()
+        && request.auth.uid == uid
+        && resource.data.get('userId', uid) == uid
+        && request.resource.data.get('userId', uid) == uid;
+      allow delete: if signedIn() && request.auth.uid == uid;
+    }
+
+    match /publicProfiles/{uid} {
+      allow get: if signedIn();
+      allow list: if false;
+      allow create, update: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['displayName', 'photoURL', 'isOnline', 'updatedAt']);
+      allow delete: if signedIn() && request.auth.uid == uid;
+    }
+
+    match /contacts/{contactId} {
+      allow get, list: if signedIn() && resource.data.creatorId == request.auth.uid;
+      allow create: if signedIn() && request.resource.data.creatorId == request.auth.uid;
+      allow update: if signedIn()
+        && resource.data.creatorId == request.auth.uid
+        && request.resource.data.creatorId == resource.data.creatorId;
+      allow delete: if signedIn() && resource.data.creatorId == request.auth.uid;
+    }
+
+    match /invitations/{invitationId} {
+      allow get: if isInvitationParty() || isRoomManager(resource.data.reunionId);
+      allow list: if signedIn()
+        && (resource.data.contactId == request.auth.uid
+          || resource.data.callerId == request.auth.uid
+          || isRoomManager(resource.data.reunionId));
+      allow create: if signedIn()
+        && request.resource.data.callerId == request.auth.uid
+        && request.resource.data.reunionId is string
+        && isRoomManager(request.resource.data.reunionId)
+        && request.resource.data.contactId in get(/databases/$(database)/documents/reunions/$(request.resource.data.reunionId)).data.invitedUserIds;
+      allow update: if signedIn()
+        && request.resource.data.reunionId == resource.data.reunionId
+        && request.resource.data.callerId == resource.data.callerId
+        && request.resource.data.contactId == resource.data.contactId
+        && request.resource.data.role == resource.data.role
+        && ((resource.data.contactId == request.auth.uid
+            && request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['status', 'viewed', 'debut', 'dateFin', 'updatedAt'])
+            && request.resource.data.status in ['accepted', 'declined', 'missed'])
+          || (resource.data.callerId == request.auth.uid
+            && request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['status', 'viewed', 'debut', 'dateFin', 'updatedAt', 'url', 'roomId'])
+            && (request.resource.data.status == resource.data.status
+              || request.resource.data.status in ['pending', 'missed', 'cancelled'])));
+      allow delete: if signedIn()
+        && (resource.data.callerId == request.auth.uid
+          || get(/databases/$(database)/documents/reunions/$(resource.data.reunionId)).data.creatorId == request.auth.uid);
+    }
+
+    match /conversations/{conversationId} {
+      allow get, list: if signedIn() && request.auth.uid in resource.data.participantIds;
+      allow create: if signedIn()
+        && request.resource.data.participantIds is list
+        && request.auth.uid in request.resource.data.participantIds
+        && request.resource.data.participantIds.size() >= 2;
+      allow update: if isConversationMember(conversationId)
+        && ((request.resource.data.participantIds == resource.data.participantIds
+            && request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['lastMessage', 'lastMessageTime', 'updatedAt', 'deletedFor'])
+            && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['deletedFor'])
+              || (request.resource.data.deletedFor is list
+                && request.auth.uid in request.resource.data.deletedFor
+                && (!('deletedFor' in resource.data)
+                  || request.resource.data.deletedFor.hasAll(resource.data.deletedFor)))))
+          || (resource.data.type == 'group'
+            && resource.data.creatorId == request.auth.uid
+            && request.resource.data.creatorId == resource.data.creatorId
+            && request.resource.data.participantIds is list
+            && request.auth.uid in request.resource.data.participantIds
+            && request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['participantIds', 'updatedAt', 'groupName', 'groupObjective', 'groupDescription'])));
+      allow delete: if false;
+
+      match /messages/{messageId} {
+        allow get, list: if isConversationMember(conversationId);
+        allow create: if isConversationMember(conversationId)
+          && request.resource.data.senderId == request.auth.uid;
+        allow update: if isConversationMember(conversationId)
+          && request.resource.data.senderId == resource.data.senderId
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['readBy'])
+          && request.resource.data.readBy is list
+          && request.auth.uid in request.resource.data.readBy
+          && request.resource.data.readBy.hasAll(resource.data.readBy);
+        allow delete: if isConversationMember(conversationId)
+          && resource.data.senderId == request.auth.uid;
+      }
+    }
+
+    match /notifications/{notificationId} {
+      function invitation() {
+        return get(/databases/$(database)/documents/invitations/$(request.resource.data.invitationId)).data;
+      }
+      allow get, list: if signedIn() && resource.data.recipientId == request.auth.uid;
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['type', 'recipientId', 'callerId', 'reunionId', 'invitationId', 'userName', 'callerName', 'createdAt', 'read'])
+        && request.resource.data.read == false
+        && exists(/databases/$(database)/documents/invitations/$(request.resource.data.invitationId))
+        && invitation().reunionId == request.resource.data.reunionId
+        && ((request.resource.data.type == 'invitation_received'
+            && invitation().callerId == request.auth.uid
+            && invitation().contactId == request.resource.data.recipientId)
+          || (request.resource.data.type == 'invitation_accepted'
+            && invitation().contactId == request.auth.uid
+            && invitation().callerId == request.resource.data.recipientId
+            && invitation().status == 'accepted')
+          || (request.resource.data.type == 'invitation_declined'
+            && invitation().contactId == request.auth.uid
+            && invitation().callerId == request.resource.data.recipientId
+            && invitation().status == 'declined'));
+      allow update: if signedIn()
+        && resource.data.recipientId == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read'])
+        && request.resource.data.read == true;
+      allow delete: if false;
+    }
+
+    function isGroupMember(groupId) {
+      return signedIn()
+        && exists(/databases/$(database)/documents/groups/$(groupId))
+        && 'memberIds' in get(/databases/$(database)/documents/groups/$(groupId)).data
+        && request.auth.uid in get(/databases/$(database)/documents/groups/$(groupId)).data.memberIds;
+    }
+
+    match /groups/{groupId} {
+      allow get, list: if signedIn()
+        && 'memberIds' in resource.data
+        && request.auth.uid in resource.data.memberIds;
+      allow create: if signedIn()
+        && request.resource.data.creatorId == request.auth.uid
+        && request.resource.data.memberIds is list
+        && request.auth.uid in request.resource.data.memberIds;
+      allow update: if signedIn()
+        && resource.data.creatorId == request.auth.uid
+        && request.resource.data.creatorId == resource.data.creatorId
+        && request.resource.data.memberIds is list
+        && request.auth.uid in request.resource.data.memberIds;
+      allow delete: if false;
+    }
+
+    match /groupCalls/{callId} {
+      allow get, list: if signedIn()
+        && (resource.data.creatorId == request.auth.uid
+          || request.auth.uid in resource.data.selectedParticipants);
+      allow create: if signedIn()
+        && request.resource.data.creatorId == request.auth.uid
+        && isGroupMember(request.resource.data.groupId)
+        && request.resource.data.selectedParticipants is list
+        && get(/databases/$(database)/documents/groups/$(request.resource.data.groupId)).data.memberIds.hasAll(request.resource.data.selectedParticipants);
+      allow update, delete: if false;
+    }
+
+    match /callNotifications/{notificationId} {
+      allow get, list: if signedIn()
+        && (resource.data.recipientId == request.auth.uid || resource.data.callerId == request.auth.uid);
+      allow create: if signedIn()
+        && request.resource.data.callerId == request.auth.uid
+        && isGroupMember(request.resource.data.groupId)
+        && exists(/databases/$(database)/documents/groupCalls/$(request.resource.data.callId))
+        && get(/databases/$(database)/documents/groupCalls/$(request.resource.data.callId)).data.creatorId == request.auth.uid
+        && request.resource.data.recipientId in get(/databases/$(database)/documents/groupCalls/$(request.resource.data.callId)).data.selectedParticipants;
+      allow update: if signedIn()
+        && resource.data.recipientId == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['viewed', 'status']);
+      allow delete: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
